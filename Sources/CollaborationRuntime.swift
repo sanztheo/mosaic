@@ -3529,17 +3529,23 @@ final class CollaborationRuntime {
         let kind = rawKind.flatMap(ClaudeRoomEventKind.init(rawValue:)) ?? .message
         let fromSurfaceID = fromSurfaceUUID?.uuidString ?? rawFromSurfaceID
         let fromMemberID = fromSurfaceUUID.flatMap { agentRoomMemberIDsBySurfaceID[$0] }
+        // Canonicalize targets up front: CLI/hook callers may pass lowercase
+        // UUIDs, but room members and wake dispatch match against the
+        // uppercase form `UUID.uuidString` always produces.
+        let targetSurfaceIDs = rawTargetSurfaceIDs.map(Self.normalizedAgentRoomSurfaceID)
+        if targetSurfaceIDs.count == 1, let fromSurfaceID, targetSurfaceIDs[0] == fromSurfaceID {
+            // The sender resolved to the post's only target: nobody would
+            // ever receive this event (wake/consume both exclude the
+            // sender's own surface), so reject instead of appending a
+            // message that can never be delivered.
+            return [
+                "posted": false,
+                "error": "Post is self-addressed; pass --from-surface for the sending pane.",
+            ]
+        }
         #if DEBUG
         if fromSurfaceUUID.flatMap({ agentRoomIDsBySurfaceID[$0] }) != roomID {
             mosaicDebugLog("agentRoom.post: from surface \(fromSurfaceID ?? "nil") is not a mapped member of room \(roomID); event still posts but peers may be unreachable")
-        }
-        if rawFromSurfaceID == nil, let fromSurfaceID, !rawTargetSurfaceIDs.isEmpty,
-           rawTargetSurfaceIDs.allSatisfy({ UUID(uuidString: $0)?.uuidString == fromSurfaceID }) {
-            // The focused-panel fallback resolved the sender to the post's only
-            // target: the event is self-addressed and wake/consume will skip
-            // it. The CLI should have pinned --from-surface (or inherited
-            // MOSAIC_SURFACE_ID); log so mis-attribution is diagnosable.
-            mosaicDebugLog("agentRoom.post: focused-panel fallback attributed post to its own target \(fromSurfaceID); event will not be delivered to anyone")
         }
         #endif
         let result = await agentRoomStore.appendEvent(
@@ -3547,7 +3553,7 @@ final class CollaborationRuntime {
             kind: kind,
             fromMemberID: fromMemberID,
             fromSurfaceID: fromSurfaceID,
-            targetSurfaceIDs: rawTargetSurfaceIDs,
+            targetSurfaceIDs: targetSurfaceIDs,
             text: text
         )
         cacheAgentRoom(result.room)
@@ -3557,87 +3563,14 @@ final class CollaborationRuntime {
         // targeted question/handoff/blocker additionally wakes idle local
         // targets by typing the relay prompt into their pane, so a ping does
         // not strand in the ledger until the user manually prompts the peer.
-        await dispatchAgentRoomWake(for: result.event, room: result.room)
+        // `posted` reflects the ledger append (always true once we get
+        // here); `delivery` is the honest per-target wake outcome.
+        let delivery = await dispatchAgentRoomWake(for: result.event, room: result.room)
         return [
             "posted": true,
             "event": encodedJSONObject(result.event),
             "room": agentRoomPayload(result.room),
-        ]
-    }
-
-    func postAgentRoomEventForAutomationRequest(
-        roomID: String?,
-        kind: String?,
-        fromSurfaceID: String?,
-        targetSurfaceIDs: [String],
-        text: String
-    ) -> [String: Any] {
-        let payload = postAgentRoomEventSnapshotForAutomation(
-            roomID: roomID,
-            kind: kind,
-            fromSurfaceID: fromSurfaceID,
-            targetSurfaceIDs: targetSurfaceIDs,
-            text: text
-        )
-        if let room = payload["room_snapshot"] as? ClaudeRoomSnapshot,
-           let event = payload["event_snapshot"] as? ClaudeRoomEvent {
-            Task { @MainActor in
-                await agentRoomStore.apply(snapshot: room)
-                try? await send(.agentRoomEvent(event))
-                await dispatchAgentRoomWake(for: event, room: room)
-            }
-            return [
-                "posted": true,
-                "event": encodedJSONObject(event),
-                "room": agentRoomPayload(room),
-            ]
-        }
-        if let publicPayload = payload["payload"] as? [String: Any] {
-            return publicPayload
-        }
-        return ["posted": false, "error": "No Claude room is active."]
-    }
-
-    private func postAgentRoomEventSnapshotForAutomation(
-        roomID requestedRoomID: String?,
-        kind rawKind: String?,
-        fromSurfaceID rawFromSurfaceID: String?,
-        targetSurfaceIDs rawTargetSurfaceIDs: [String],
-        text: String
-    ) -> [String: Any] {
-        let fromSurfaceUUID = resolveAgentRoomSurfaceID(rawFromSurfaceID)
-        let roomID = AgentRoomSelection.roomIDForSurfaceOperation(
-            requestedRoomID: requestedRoomID,
-            surfaceWasExplicit: rawFromSurfaceID != nil,
-            mappedSurfaceRoomID: fromSurfaceUUID.flatMap { agentRoomIDsBySurfaceID[$0] },
-            latestRoomID: latestAgentRoomID
-        )
-        guard let roomID else {
-            return ["payload": ["posted": false, "error": "No Claude room is active."]]
-        }
-        let kind = rawKind.flatMap(ClaudeRoomEventKind.init(rawValue:)) ?? .message
-        let fromSurfaceID = fromSurfaceUUID?.uuidString ?? rawFromSurfaceID
-        let fromMemberID = fromSurfaceUUID.flatMap { agentRoomMemberIDsBySurfaceID[$0] }
-        var room = agentRoomSnapshotsByID[roomID] ?? ClaudeRoomSnapshot(id: roomID)
-        let event = ClaudeRoomEvent(
-            sequence: room.lastSequence + 1,
-            roomID: roomID,
-            kind: kind,
-            fromMemberID: fromMemberID,
-            fromSurfaceID: fromSurfaceID,
-            targetSurfaceIDs: rawTargetSurfaceIDs,
-            text: text
-        )
-        room.lastSequence = event.sequence
-        room.events.append(event)
-        if room.events.count > 200 {
-            room.events.removeFirst(room.events.count - 200)
-        }
-        cacheAgentRoom(room)
-        latestAgentRoomID = roomID
-        return [
-            "room_snapshot": room,
-            "event_snapshot": event,
+            "delivery": delivery,
         ]
     }
 
@@ -3765,6 +3698,9 @@ final class CollaborationRuntime {
                 memberID: memberID,
                 surfaceID: recipientSurfaceID
             )
+            if let synced = await agentRoomStore.room(id: roomID) {
+                cacheAgentRoom(synced)
+            }
             return ["text": ""]
         }
         // Consume drains only pushed ledger events. Live content is pushed by
@@ -3777,6 +3713,12 @@ final class CollaborationRuntime {
             memberID: memberID,
             surfaceID: recipientSurfaceID
         )
+        // consumePendingEvents only advances the member's acknowledgment
+        // cursor in the store; refresh the display cache too so it stops
+        // drifting behind what the store actually holds.
+        if let synced = await agentRoomStore.room(id: roomID) {
+            cacheAgentRoom(synced)
+        }
         let prompts = pending.compactMap { event in
             agentRoomActiveDispatchPromptBuilder.broadcastPrompt(
                 for: event,
@@ -3797,8 +3739,13 @@ final class CollaborationRuntime {
     /// Busy or permission-prompting agents are skipped here; the ledger keeps
     /// the event and the Stop hook's `agent.room.wake_flush` delivers it when
     /// the target settles idle.
-    private func dispatchAgentRoomWake(for event: ClaudeRoomEvent, room: ClaudeRoomSnapshot) async {
-        guard agentRoomActiveDispatchPromptBuilder.shouldDispatch(event) else { return }
+    ///
+    /// Returns the per-target outcome (see `AgentRoomWakeOutcome`) so a
+    /// poster can see honestly whether a targeted event was actually
+    /// injected, not just that it was appended to the ledger.
+    @discardableResult
+    private func dispatchAgentRoomWake(for event: ClaudeRoomEvent, room: ClaudeRoomSnapshot) async -> [String: String] {
+        guard agentRoomActiveDispatchPromptBuilder.shouldDispatch(event) else { return [:] }
         var targetSurfaceIDs = Set(event.targetSurfaceIDs.map(Self.normalizedAgentRoomSurfaceID))
         for member in room.members where event.targetMemberIDs.contains(member.id) {
             targetSurfaceIDs.insert(Self.normalizedAgentRoomSurfaceID(member.surfaceID))
@@ -3806,15 +3753,37 @@ final class CollaborationRuntime {
         if let fromSurfaceID = event.fromSurfaceID {
             targetSurfaceIDs.remove(Self.normalizedAgentRoomSurfaceID(fromSurfaceID))
         }
+        var delivery: [String: String] = [:]
         for surfaceID in targetSurfaceIDs {
-            _ = await wakeAgentRoomSurface(surfaceID: surfaceID, roomID: event.roomID)
+            delivery[surfaceID] = await wakeAgentRoomSurface(surfaceID: surfaceID, roomID: event.roomID).rawValue
         }
+        return delivery
     }
 
     /// Uppercases UUID-shaped surface ids so CLI-supplied lowercase targets
     /// match the canonical uppercase ids the room members carry.
     private static func normalizedAgentRoomSurfaceID(_ raw: String) -> String {
         UUID(uuidString: raw.trimmingCharacters(in: .whitespacesAndNewlines))?.uuidString ?? raw
+    }
+
+    /// Per-target outcome of one `wakeAgentRoomSurface` attempt, reported
+    /// back to `agent.room.post` callers under `delivery` so the response is
+    /// honest about whether a targeted event actually reached a live pane.
+    enum AgentRoomWakeOutcome: String {
+        /// The pending backlog was typed into the pane and submitted.
+        case injected
+        /// The target's Claude session is mid-turn; the Stop hook's
+        /// `agent.room.wake_flush` delivers once it settles idle.
+        case deferredRunning = "deferred_running"
+        /// No hook-linked Claude session is bound to that surface.
+        case noHookSession = "no_hook_session"
+        /// The room wasn't found, or the surface isn't hosted in this app
+        /// instance (no local terminal panel resolves for it).
+        case notLocal = "not_local"
+        /// Nothing dispatch-worthy is pending for that surface.
+        case noPending = "no_pending"
+        /// The pane refused the injected text.
+        case wakeError = "wake_error"
     }
 
     /// Drains the surface's pending room backlog and types it into the pane
@@ -3829,11 +3798,11 @@ final class CollaborationRuntime {
     /// only after the terminal accepts the text, so a skipped or failed
     /// injection never swallows undelivered events. Relay-header loop
     /// protection lives in the publish hooks (`isMosaicRoomRelayPrompt`).
-    private func wakeAgentRoomSurface(surfaceID rawSurfaceID: String, roomID: String) async -> Bool {
+    private func wakeAgentRoomSurface(surfaceID rawSurfaceID: String, roomID: String) async -> AgentRoomWakeOutcome {
         let surfaceID = Self.normalizedAgentRoomSurfaceID(rawSurfaceID)
         guard let room = await agentRoomStore.room(id: roomID),
               let panel = terminalForAutomation(workspaceID: nil, surfaceID: surfaceID) else {
-            return false
+            return .notLocal
         }
         // Without a hook-linked Claude session the pane may be a plain shell;
         // typing a prompt there would execute it as shell input.
@@ -3841,7 +3810,7 @@ final class CollaborationRuntime {
             #if DEBUG
             mosaicDebugLog("agentRoom.wake skipped surface \(surfaceID.prefix(8)): no hook-linked Claude session")
             #endif
-            return false
+            return .noHookSession
         }
         // Defer only while mid-turn (`running`); the Stop hook's wake_flush
         // delivers once the turn settles. `needsInput` is deliberately NOT a
@@ -3855,7 +3824,7 @@ final class CollaborationRuntime {
             #if DEBUG
             mosaicDebugLog("agentRoom.wake deferred surface \(surfaceID.prefix(8)): lifecycle=\(hook.agentLifecycle ?? "nil")")
             #endif
-            return false
+            return .deferredRunning
         }
         let memberID = room.members.first(where: { $0.surfaceID == surfaceID })?.id
         let pending = await agentRoomStore.pendingEvents(
@@ -3864,7 +3833,7 @@ final class CollaborationRuntime {
             surfaceID: surfaceID
         )
         guard pending.contains(where: { agentRoomActiveDispatchPromptBuilder.shouldDispatch($0) }) else {
-            return false
+            return .noPending
         }
         let prompts = pending.compactMap {
             agentRoomActiveDispatchPromptBuilder.broadcastPrompt(
@@ -3873,8 +3842,8 @@ final class CollaborationRuntime {
                 recipientSurfaceID: surfaceID
             )
         }
-        guard !prompts.isEmpty else { return false }
-        guard panel.sendText(prompts.joined(separator: "\n\n")) else { return false }
+        guard !prompts.isEmpty else { return .noPending }
+        guard panel.sendText(prompts.joined(separator: "\n\n")) else { return .wakeError }
         // `sendText` delivers the whole prompt as one bracketed paste, which
         // Claude Code's line editor holds as a single block, so a plain
         // return submits it (verified empirically; ctrl+enter is ignored on a
@@ -3895,7 +3864,7 @@ final class CollaborationRuntime {
         #if DEBUG
         mosaicDebugLog("agentRoom.wake injected \(pending.count) event(s) into surface \(surfaceID.prefix(8))")
         #endif
-        return true
+        return .injected
     }
 
     /// `agent.room.wake_flush`: the Stop hook's turn-boundary trigger. The
@@ -3915,8 +3884,8 @@ final class CollaborationRuntime {
         guard let roomID, let surfaceID = surfaceUUID?.uuidString else {
             return ["woken": false]
         }
-        let woken = await wakeAgentRoomSurface(surfaceID: surfaceID, roomID: roomID)
-        return ["woken": woken]
+        let outcome = await wakeAgentRoomSurface(surfaceID: surfaceID, roomID: roomID)
+        return ["woken": outcome == .injected]
     }
 
     /// Builds a full room recap for a surface whose Claude session just

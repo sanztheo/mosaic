@@ -88,6 +88,14 @@ public enum ControlCommandExecutionPolicy: Sendable, Equatable {
         // it runs async on the socket worker like consume/recap; the terminal
         // injection inside hops back to the main actor.
         "agent.room.wake_flush",
+        // `agent.room.post` awaits the ClaudeRoomStore actor via
+        // postAgentRoomEventForAutomation for a real appendEvent + broadcast +
+        // wake dispatch, so it must run async on the socket worker like its
+        // consume/recap/wake_flush siblings; classifying it .mainActor made
+        // the correct handler in socketWorkerV2Response unreachable and
+        // routed to a buggy synchronous-cache handler in processV2Command
+        // instead.
+        "agent.room.post",
         "system.top",
         "system.memory",
         // `workspace.env` is a read that resolves a workspace and copies its

@@ -2042,21 +2042,9 @@ class TerminalController {
                 roomID: roomID,
                 surfaceID: surfaceID
             )))
-        case "agent.room.post":
-            guard let text = params["text"] as? String, !text.isEmpty else {
-                return v2Result(id: id, .err(code: "invalid_params", message: "agent.room.post requires text", data: nil))
-            }
-            let roomID = params["room_id"] as? String
-            let kind = params["kind"] as? String
-            let fromSurfaceID = params["from_surface_id"] as? String
-            let targetSurfaceIDs = params["target_surface_ids"] as? [String] ?? []
-            return v2Result(id: id, .ok(CollaborationRuntime.shared.postAgentRoomEventForAutomationRequest(
-                roomID: roomID,
-                kind: kind,
-                fromSurfaceID: fromSurfaceID,
-                targetSurfaceIDs: targetSurfaceIDs,
-                text: text
-            )))
+        // agent.room.post is handled by socketWorkerV2Response (its
+        // ControlCommandExecutionPolicy is .socketWorker), so it never
+        // reaches this main-actor switch.
         case "agent.room.digest":
             let roomID = params["room_id"] as? String
             let surfaceID = params["surface_id"] as? String

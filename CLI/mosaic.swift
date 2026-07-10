@@ -6583,9 +6583,26 @@ struct MosaicCLI {
     ) {
         if jsonOutput {
             print(jsonString(formatIDs(payload, mode: idFormat)))
-        } else {
-            print(fallbackText)
+            return
         }
+        // `agent.room.post` is the only caller whose payload carries a
+        // `posted` key: a rejected post (e.g. self-addressed) must not print
+        // the generic success fallback, and a delivered targeted post should
+        // show what actually happened at each target instead of staying silent.
+        if let posted = payload["posted"] as? Bool {
+            guard posted else {
+                print((payload["error"] as? String) ?? fallbackText)
+                return
+            }
+            print(fallbackText)
+            if let delivery = payload["delivery"] as? [String: String], !delivery.isEmpty {
+                for (surfaceID, outcome) in delivery.sorted(by: { $0.key < $1.key }) {
+                    print("  \(surfaceID): \(outcome)")
+                }
+            }
+            return
+        }
+        print(fallbackText)
     }
 
     private func runSurfaceCommand(
