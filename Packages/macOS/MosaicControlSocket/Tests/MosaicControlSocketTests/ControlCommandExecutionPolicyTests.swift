@@ -60,11 +60,19 @@ struct ControlCommandExecutionPolicyTests {
         // agent.room.wake_flush (Stop-hook wake trigger) awaits the same actor
         // and reads the hook session store, so it shares the worker lane too.
         #expect(ControlCommandExecutionPolicy(forMethod: "agent.room.wake_flush") == .socketWorker(mainThreadCallable: false))
-        // The other agent.room.* verbs intentionally stay on the main actor
-        // (processCommand serves them); guard the asymmetry so a future edit
-        // does not silently move consume off the worker lane again.
+        // agent.room.post awaits the ClaudeRoomStore actor via
+        // postAgentRoomEventForAutomation for a real appendEvent + broadcast +
+        // wake dispatch, so it must run async on the socket worker like its
+        // consume/recap/wake_flush siblings; classifying it .mainActor makes
+        // the correct handler in socketWorkerV2Response unreachable and routes
+        // to the buggy synchronous-cache handler in processV2Command instead.
+        #expect(ControlCommandExecutionPolicy(forMethod: "agent.room.post") == .socketWorker(mainThreadCallable: false))
+        // agent.room.digest remains the example of an agent.room.* verb
+        // intentionally left on the main actor (processCommand serves it
+        // synchronously from the display cache); guard the asymmetry so a
+        // future edit does not silently move consume/post off the worker lane
+        // again.
         #expect(ControlCommandExecutionPolicy(forMethod: "agent.room.digest") == .mainActor)
-        #expect(ControlCommandExecutionPolicy(forMethod: "agent.room.post") == .mainActor)
     }
 
     @Test func everythingElseRunsOnTheMainActor() {
