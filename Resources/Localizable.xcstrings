@@ -38366,6 +38366,28 @@
         }
       }
     },
+    "collaboration.agentRoom.delivery.stuck": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "A Claude room message could not be delivered to a pane. It stays queued and will arrive at the pane's next turn."
+          }
+        }
+      }
+    },
+    "collaboration.agentRoom.delivery.stuckTitle": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Agent Room"
+          }
+        }
+      }
+    },
     "collaboration.agentRoom.labelFormat": {
       "extractionState": "manual",
       "localizations": {

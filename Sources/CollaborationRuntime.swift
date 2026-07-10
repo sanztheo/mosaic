@@ -3784,6 +3784,12 @@ final class CollaborationRuntime {
         case noPending = "no_pending"
         /// The pane refused the injected text.
         case wakeError = "wake_error"
+        /// The prompt was typed and a return key was sent (with resends on
+        /// timeout), but the target's lifecycle never confirmed the turn
+        /// started. The pending events were NOT consumed -- they stay queued
+        /// for the Stop hook's `agent.room.wake_flush` or the next natural
+        /// consume boundary.
+        case submitUnconfirmed = "submit_unconfirmed"
     }
 
     /// Drains the surface's pending room backlog and types it into the pane
@@ -3848,11 +3854,23 @@ final class CollaborationRuntime {
         // Claude Code's line editor holds as a single block, so a plain
         // return submits it (verified empirically; ctrl+enter is ignored on a
         // pasted block, unlike the TextBox composer's typed-newline case).
-        // The TUI needs a beat to ingest the paste before the submit key: a
-        // return sent in the same instant is swallowed and the block sits
-        // unsubmitted at the prompt (observed in the tagged-app dogfood).
-        try? await Task.sleep(nanoseconds: 600_000_000)
+        // The TUI needs a beat to ingest the paste before it accepts the
+        // submit key: a return sent too early is silently swallowed and the
+        // block sits unsubmitted at the prompt (observed in the tagged-app
+        // dogfood). Rather than gamble on a fixed delay, confirm the submit
+        // actually landed by polling the target's own hook-reported
+        // lifecycle for evidence its turn started, resending the return key
+        // on timeout -- see `AgentRoomSubmitConfirmation`.
         _ = panel.sendNamedKeyResult("return")
+        guard await confirmAgentRoomSubmission(surfaceID: surfaceID, panel: panel) else {
+            #if DEBUG
+            mosaicDebugLog(
+                "agentRoom.wake submit unconfirmed surface \(surfaceID.prefix(8)) after \(AgentRoomSubmitConfirmation.maxAttempts) attempt(s)"
+            )
+            #endif
+            notifyAgentRoomDeliveryStuck(panel: panel)
+            return .submitUnconfirmed
+        }
         _ = await agentRoomStore.consumePendingEvents(
             roomID: roomID,
             memberID: memberID,
@@ -3865,6 +3883,70 @@ final class CollaborationRuntime {
         mosaicDebugLog("agentRoom.wake injected \(pending.count) event(s) into surface \(surfaceID.prefix(8))")
         #endif
         return .injected
+    }
+
+    /// Polls the target's hook-reported lifecycle for evidence a submitted
+    /// return key actually started its turn, re-sending the return key on
+    /// timeout (the swallowed-return case) up to
+    /// `AgentRoomSubmitConfirmation.maxAttempts` total sends. Uses
+    /// `Task.sleep` throughout so the main actor is never blocked while this
+    /// polls.
+    ///
+    /// Edge case: a lifecycle that flips to `running` because the HUMAN
+    /// typed something concurrently is indistinguishable from our submit
+    /// landing. That ambiguity is accepted -- either way the pending events
+    /// are safe to consume, since a swallowed submit under that exact race
+    /// still gets a natural resend opportunity at the next post/wake_flush.
+    private func confirmAgentRoomSubmission(surfaceID: String, panel: TerminalPanel) async -> Bool {
+        var attempt = 1
+        var attemptStart = Date()
+        while true {
+            try? await Task.sleep(
+                nanoseconds: UInt64(AgentRoomSubmitConfirmation.pollInterval * 1_000_000_000)
+            )
+            let lifecycleIsRunning = Self.claudeHookSessionRef(surfaceID: surfaceID)?.agentLifecycle
+                == AgentHibernationLifecycleState.running.rawValue
+            let elapsed = Date().timeIntervalSince(attemptStart)
+            switch AgentRoomSubmitConfirmation.verdict(
+                attempt: attempt,
+                lifecycleIsRunning: lifecycleIsRunning,
+                elapsedSinceAttempt: elapsed
+            ) {
+            case .confirmed:
+                return true
+            case .wait:
+                continue
+            case .resend:
+                _ = panel.sendNamedKeyResult("return")
+                attempt += 1
+                attemptStart = Date()
+            case .giveUp:
+                return false
+            }
+        }
+    }
+
+    /// How long to wait before re-notifying about a stuck delivery to the
+    /// same pane, so a chronically stalled target doesn't spam a
+    /// notification on every post.
+    private static let agentRoomDeliveryStuckNotificationCooldown: TimeInterval = 5 * 60
+
+    /// Surfaces a user-visible notification when the submit-confirmation
+    /// loop exhausts its attempts. The pending events themselves stay queued
+    /// (never consumed here) and still arrive at the pane's next turn via
+    /// the Stop hook's `wake_flush` or the next natural consume, but the
+    /// user should know delivery stalled rather than silently trust
+    /// `posted: true`.
+    private func notifyAgentRoomDeliveryStuck(panel: TerminalPanel) {
+        TerminalNotificationStore.shared.addNotification(
+            tabId: panel.workspaceId,
+            surfaceId: panel.id,
+            title: CollaborationStrings.agentRoomDeliveryStuckTitle,
+            subtitle: "",
+            body: CollaborationStrings.agentRoomDeliveryStuckBody,
+            cooldownKey: "agentRoom.delivery.stuck:\(panel.id.uuidString)",
+            cooldownInterval: Self.agentRoomDeliveryStuckNotificationCooldown
+        )
     }
 
     /// `agent.room.wake_flush`: the Stop hook's turn-boundary trigger. The
@@ -7648,6 +7730,17 @@ private enum CollaborationTextDiff {
 enum CollaborationStrings {
     static var collaborate: String {
         String(localized: "collaboration.toolbar.collaborate", defaultValue: "Collaborate")
+    }
+
+    static var agentRoomDeliveryStuckTitle: String {
+        String(localized: "collaboration.agentRoom.delivery.stuckTitle", defaultValue: "Agent Room")
+    }
+
+    static var agentRoomDeliveryStuckBody: String {
+        String(
+            localized: "collaboration.agentRoom.delivery.stuck",
+            defaultValue: "A Claude room message could not be delivered to a pane. It stays queued and will arrive at the pane's next turn."
+        )
     }
 
     static var shareTerminal: String {
