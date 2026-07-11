@@ -1084,6 +1084,11 @@ final class CollaborationRuntime {
     /// disk (dead link: hooks never registered, so the agent neither publishes
     /// nor receives). Cached off the view path; the header pill only reads it.
     private var agentRoomDegradedSurfaceIDs: Set<UUID> = []
+    /// Keys (`"\(roomID)|\(surfaceID)"`) with a deferred-wake retry chain
+    /// currently running, so concurrent posts to the same stuck pane collapse
+    /// onto the one already in flight instead of stacking duplicate timers.
+    /// See `AgentRoomDeferredWakeRetry`.
+    @ObservationIgnored private var agentRoomDeferredWakeRetryInFlightKeys: Set<String> = []
     @ObservationIgnored private var agentRoomWireAnchorsBySurfaceID: [UUID: AgentRoomWireAnchor] = [:]
     @ObservationIgnored private let agentRoomWireOverlay = AgentRoomWireOverlayController()
     @ObservationIgnored private var draggingAgentRoomSourceSurfaceID: UUID?
@@ -3755,7 +3760,17 @@ final class CollaborationRuntime {
         }
         var delivery: [String: String] = [:]
         for surfaceID in targetSurfaceIDs {
-            delivery[surfaceID] = await wakeAgentRoomSurface(surfaceID: surfaceID, roomID: event.roomID).rawValue
+            let outcome = await wakeAgentRoomSurface(surfaceID: surfaceID, roomID: event.roomID)
+            delivery[surfaceID] = outcome.rawValue
+            if outcome == .deferredRunning {
+                // The Stop hook's `wake_flush` is the primary recovery path,
+                // but it never fires for a session whose lifecycle got stuck
+                // at `running` without a real turn ever starting (e.g. a pane
+                // where the user only ran a built-in slash command). This
+                // bounded chain reaps that case instead of stranding the
+                // event until the pane's next real prompt.
+                scheduleAgentRoomDeferredWakeRetry(surfaceID: surfaceID, roomID: event.roomID)
+            }
         }
         return delivery
     }
@@ -3804,7 +3819,19 @@ final class CollaborationRuntime {
     /// only after the terminal accepts the text, so a skipped or failed
     /// injection never swallows undelivered events. Relay-header loop
     /// protection lives in the publish hooks (`isMosaicRoomRelayPrompt`).
-    private func wakeAgentRoomSurface(surfaceID rawSurfaceID: String, roomID: String) async -> AgentRoomWakeOutcome {
+    ///
+    /// - Parameter overrideStaleRunning: set only by the deferred-wake retry
+    ///   chain (`AgentRoomDeferredWakeRetry`) once it has confirmed, via a
+    ///   fresh recheck, that a `running` lifecycle is stale on both the hook
+    ///   store's `updatedAt` and the transcript's mtime. It bypasses only the
+    ///   `running` defer check below -- the hook-linked-session requirement
+    ///   above still applies unconditionally, so this never types into a
+    ///   plain shell.
+    private func wakeAgentRoomSurface(
+        surfaceID rawSurfaceID: String,
+        roomID: String,
+        overrideStaleRunning: Bool = false
+    ) async -> AgentRoomWakeOutcome {
         let surfaceID = Self.normalizedAgentRoomSurfaceID(rawSurfaceID)
         guard let room = await agentRoomStore.room(id: roomID),
               let panel = terminalForAutomation(workspaceID: nil, surfaceID: surfaceID) else {
@@ -3826,7 +3853,11 @@ final class CollaborationRuntime {
         // sits at `needsInput`, and no later hook ever flips it to `idle`, so
         // deferring on it would strand every ping forever). The rare
         // mid-dialog overlap this admits is the accepted trade-off.
-        if hook.agentLifecycle == AgentHibernationLifecycleState.running.rawValue {
+        //
+        // `overrideStaleRunning` bypasses this specific check only after the
+        // deferred-wake retry chain has confirmed the `running` state itself
+        // is stale (see the parameter doc above and `AgentRoomDeferredWakeRetry`).
+        if hook.agentLifecycle == AgentHibernationLifecycleState.running.rawValue, !overrideStaleRunning {
             #if DEBUG
             mosaicDebugLog("agentRoom.wake deferred surface \(surfaceID.prefix(8)): lifecycle=\(hook.agentLifecycle ?? "nil")")
             #endif
@@ -3883,6 +3914,85 @@ final class CollaborationRuntime {
         mosaicDebugLog("agentRoom.wake injected \(pending.count) event(s) into surface \(surfaceID.prefix(8))")
         #endif
         return .injected
+    }
+
+    /// Builds the collapsing key for in-flight deferred-wake retry chains.
+    private static func agentRoomDeferredWakeRetryKey(surfaceID: String, roomID: String) -> String {
+        "\(roomID)|\(surfaceID)"
+    }
+
+    /// Schedules a bounded retry chain after `wakeAgentRoomSurface` returns
+    /// `.deferredRunning` from a POST dispatch. A target's own Stop hook
+    /// (`agent.room.wake_flush`) remains the primary recovery path; this
+    /// chain exists for the case that hook never fires because the target's
+    /// lifecycle got stuck at `running` without a real turn ever starting
+    /// (see `AgentRoomDeferredWakeRetry`). Concurrent posts to the same
+    /// surface+room collapse onto the one chain already in flight rather than
+    /// stacking duplicate timers.
+    private func scheduleAgentRoomDeferredWakeRetry(surfaceID: String, roomID: String) {
+        let key = Self.agentRoomDeferredWakeRetryKey(surfaceID: surfaceID, roomID: roomID)
+        guard agentRoomDeferredWakeRetryInFlightKeys.insert(key).inserted else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.runAgentRoomDeferredWakeRetryChain(surfaceID: surfaceID, roomID: roomID)
+            self.agentRoomDeferredWakeRetryInFlightKeys.remove(key)
+        }
+    }
+
+    /// Runs the bounded recheck loop for one deferred wake: each iteration
+    /// reads a fresh hook-lifecycle/`updatedAt`/transcript-mtime snapshot and
+    /// asks `AgentRoomDeferredWakeRetry` what to do next. `.treatAsIdle`
+    /// bypasses the defer gate and attempts injection immediately; `.giveUp`
+    /// surfaces the same stuck-delivery notification the submit-confirmation
+    /// path uses, leaving the pending events queued for the Stop hook or the
+    /// next natural consume boundary.
+    private func runAgentRoomDeferredWakeRetryChain(surfaceID: String, roomID: String) async {
+        var attempt = 1
+        while true {
+            guard !Task.isCancelled else { return }
+            let hook = Self.claudeHookSessionRef(surfaceID: surfaceID)
+            let now = Date().timeIntervalSince1970
+            let lifecycleIsRunning = hook?.agentLifecycle == AgentHibernationLifecycleState.running.rawValue
+            let updatedAtAge = hook.map { now - $0.updatedAt }
+            let transcriptMTimeAge = Self.agentRoomTranscriptModificationAge(hook?.transcriptPath, now: now)
+            let decision = AgentRoomDeferredWakeRetry.decide(
+                attempt: attempt,
+                lifecycleIsRunning: lifecycleIsRunning,
+                updatedAtAge: updatedAtAge,
+                transcriptMTimeAge: transcriptMTimeAge
+            )
+            #if DEBUG
+            mosaicDebugLog(
+                "agentRoom.wake retry surface \(surfaceID.prefix(8)) attempt=\(attempt) lifecycle=\(hook?.agentLifecycle ?? "nil") decision=\(decision)"
+            )
+            #endif
+            switch decision {
+            case .retryLater(let delay):
+                try? await Task.sleep(for: .seconds(delay))
+                attempt += 1
+            case .treatAsIdle:
+                _ = await wakeAgentRoomSurface(surfaceID: surfaceID, roomID: roomID, overrideStaleRunning: true)
+                return
+            case .giveUp:
+                if let panel = terminalForAutomation(workspaceID: nil, surfaceID: surfaceID) {
+                    notifyAgentRoomDeliveryStuck(panel: panel)
+                }
+                return
+            }
+        }
+    }
+
+    /// Age (seconds) of a transcript file's last modification, or `nil` if
+    /// the path is unknown or unreadable. A secondary staleness signal
+    /// alongside the hook store's `updatedAt` -- see
+    /// `AgentRoomDeferredWakeRetry`.
+    private static func agentRoomTranscriptModificationAge(_ path: String?, now: TimeInterval) -> TimeInterval? {
+        guard let path,
+              let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              let mtime = attrs[.modificationDate] as? Date else {
+            return nil
+        }
+        return now - mtime.timeIntervalSince1970
     }
 
     /// Polls the target's hook-reported lifecycle for evidence a submitted
